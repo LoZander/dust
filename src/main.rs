@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     env,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -8,7 +7,11 @@ use std::{
     thread::spawn,
 };
 
-use uuid::Uuid;
+use msg::Msg;
+use queue::Queue;
+
+mod msg;
+mod queue;
 
 fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
     let listener = TcpListener::bind(ip.into())?;
@@ -57,87 +60,6 @@ impl FromStr for Command {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Msg {
-    text: String,
-    uuid: Uuid,
-}
-
-const UUID_SIZE: usize = 16;
-const SEP_SIZE: usize = 1;
-const CAPACITY: usize = 128;
-
-#[derive(Debug, thiserror::Error)]
-#[error("failed to convert `String` to `Msg`")]
-struct TryFromStringToMsgError;
-
-impl TryFrom<String> for Msg {
-    type Error = TryFromStringToMsgError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let within_capacity = value.len() + SEP_SIZE + UUID_SIZE <= CAPACITY;
-
-        let uuid = Uuid::new_v4();
-
-        assert!(!uuid.as_bytes()[0] != 0, "Uuid started with 0!");
-
-        if within_capacity {
-            Ok(Self {
-                text: value,
-                uuid: Uuid::new_v4(),
-            })
-        } else {
-            Err(TryFromStringToMsgError)
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-enum TryFromArrayToMsgError {
-    #[error("missing seperator")]
-    MissingSep,
-    #[error("uuid error: `{0}`")]
-    CorruptUuid(#[from] uuid::Error),
-}
-
-impl TryFrom<[u8; CAPACITY]> for Msg {
-    type Error = TryFromArrayToMsgError;
-
-    fn try_from(value: [u8; CAPACITY]) -> Result<Self, Self::Error> {
-        let sep = value
-            .iter()
-            .position(|c| c == &0)
-            .ok_or(TryFromArrayToMsgError::MissingSep)?;
-
-        let text_bytes = &value[..sep];
-        let uuid_bytes = &value[(sep + SEP_SIZE)..(sep + SEP_SIZE + UUID_SIZE)];
-
-        let text = String::from_utf8_lossy(text_bytes).to_string();
-        let uuid = Uuid::from_slice(uuid_bytes).unwrap();
-
-        Ok(Self { text, uuid })
-    }
-}
-
-impl Msg {
-    fn into_bytes(self) -> [u8; CAPACITY] {
-        let mut bytes = [0; CAPACITY];
-        let length = self.text.len();
-        self.text
-            .into_bytes()
-            .into_iter()
-            .enumerate()
-            .for_each(|(i, b)| bytes[i] = b);
-        self.uuid
-            .into_bytes()
-            .into_iter()
-            .enumerate()
-            .for_each(|(i, b)| bytes[i + length + SEP_SIZE] = b);
-
-        bytes
-    }
-}
-
 fn read_input() -> io::Result<mpsc::Receiver<Command>> {
     let (tx, rx) = mpsc::channel();
     spawn(move || -> io::Result<()> {
@@ -152,37 +74,6 @@ fn read_input() -> io::Result<mpsc::Receiver<Command>> {
     });
 
     Ok(rx)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Queue<T> {
-    size: usize,
-    elements: VecDeque<T>,
-}
-
-impl<T> Queue<T> {
-    fn new(size: usize) -> Self {
-        Self {
-            size,
-            elements: VecDeque::new(),
-        }
-    }
-
-    fn push(&mut self, item: T) -> Option<T> {
-        self.elements.push_back(item);
-
-        if self.elements.len() > self.size {
-            self.elements.pop_front()
-        } else {
-            None
-        }
-    }
-}
-
-impl<T: PartialEq> Queue<T> {
-    fn contains(&self, item: &T) -> bool {
-        self.elements.contains(item)
-    }
 }
 
 fn run(ip: SocketAddr) -> io::Result<()> {
@@ -248,7 +139,7 @@ fn process_msg(
     mut stream: TcpStream,
     seen: &mut Queue<Msg>,
 ) -> Option<(TcpStream, Option<(Msg, SocketAddr)>)> {
-    let mut msg = [0; CAPACITY];
+    let mut msg = [0; msg::CAPACITY];
     let addr = stream.peer_addr().expect("connection didn't have a peer");
 
     match stream.read(&mut msg) {
@@ -274,6 +165,7 @@ fn process_msg(
     }
 }
 
+/// Propagates a message `msg` received from a peer `origin` to the other peers.
 fn propagate(streams: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpStream> {
     let (mut origins, rest): (Vec<_>, Vec<_>) = streams
         .into_iter()
@@ -290,6 +182,7 @@ fn propagate(streams: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpSt
     rest
 }
 
+/// Connects to a given peer.
 fn connect(streams: &mut Vec<TcpStream>, addr: SocketAddr) -> io::Result<()> {
     let conn = TcpStream::connect(addr)?;
     conn.set_nonblocking(true)
@@ -299,6 +192,7 @@ fn connect(streams: &mut Vec<TcpStream>, addr: SocketAddr) -> io::Result<()> {
     Ok(())
 }
 
+/// Broadcasts a message to peers.
 fn broadcast(mut streams: Vec<TcpStream>, msg: Msg) -> Vec<TcpStream> {
     println!("broadcasting {msg:?}");
     streams.iter_mut().for_each(|stream| {
