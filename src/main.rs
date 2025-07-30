@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -56,7 +57,7 @@ impl FromStr for Command {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Msg {
     text: String,
     uuid: Uuid,
@@ -99,10 +100,10 @@ enum TryFromArrayToMsgError {
     CorruptUuid(#[from] uuid::Error),
 }
 
-impl TryFrom<[u8; 128]> for Msg {
+impl TryFrom<[u8; CAPACITY]> for Msg {
     type Error = TryFromArrayToMsgError;
 
-    fn try_from(value: [u8; 128]) -> Result<Self, Self::Error> {
+    fn try_from(value: [u8; CAPACITY]) -> Result<Self, Self::Error> {
         let sep = value
             .iter()
             .position(|c| c == &0)
@@ -119,8 +120,8 @@ impl TryFrom<[u8; 128]> for Msg {
 }
 
 impl Msg {
-    fn into_bytes(self) -> [u8; 128] {
-        let mut bytes = [0; 128];
+    fn into_bytes(self) -> [u8; CAPACITY] {
+        let mut bytes = [0; CAPACITY];
         let length = self.text.len();
         self.text
             .into_bytes()
@@ -131,7 +132,7 @@ impl Msg {
             .into_bytes()
             .into_iter()
             .enumerate()
-            .for_each(|(i, b)| bytes[i + length + 1] = b);
+            .for_each(|(i, b)| bytes[i + length + SEP_SIZE] = b);
 
         bytes
     }
@@ -153,9 +154,41 @@ fn read_input() -> io::Result<mpsc::Receiver<Command>> {
     Ok(rx)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queue<T> {
+    size: usize,
+    elements: VecDeque<T>,
+}
+
+impl<T> Queue<T> {
+    fn new(size: usize) -> Self {
+        Self {
+            size,
+            elements: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, item: T) -> Option<T> {
+        self.elements.push_back(item);
+
+        if self.elements.len() > self.size {
+            self.elements.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
+impl<T: PartialEq> Queue<T> {
+    fn contains(&self, item: &T) -> bool {
+        self.elements.contains(item)
+    }
+}
+
 fn run(ip: SocketAddr) -> io::Result<()> {
     println!("starting on {ip}");
     let mut streams = Vec::new();
+    let mut seen: Queue<Msg> = Queue::new(16);
 
     let in_comms = listen(ip)?;
     let cmds = read_input()?;
@@ -178,7 +211,13 @@ fn run(ip: SocketAddr) -> io::Result<()> {
                     connect(&mut streams, addr)?;
                     streams
                 }
-                Command::Broadcast(msg) => broadcast(streams, msg.try_into().unwrap()),
+                Command::Broadcast(s) => {
+                    let msg: Msg = s.try_into().unwrap();
+
+                    seen.push(msg.clone());
+
+                    broadcast(streams, msg)
+                }
                 Command::Disconnect => {
                     streams
                         .iter_mut()
@@ -189,13 +228,15 @@ fn run(ip: SocketAddr) -> io::Result<()> {
             },
         };
 
-        streams = receive_msgs(streams);
+        streams = receive_msgs(streams, &mut seen);
     }
 }
 
-fn receive_msgs(streams: Vec<TcpStream>) -> Vec<TcpStream> {
-    let (retained, propagees): (Vec<_>, Vec<_>) =
-        streams.into_iter().filter_map(process_msg).unzip();
+fn receive_msgs(streams: Vec<TcpStream>, seen: &mut Queue<Msg>) -> Vec<TcpStream> {
+    let (retained, propagees): (Vec<_>, Vec<_>) = streams
+        .into_iter()
+        .filter_map(|stream| process_msg(stream, seen))
+        .unzip();
 
     propagees
         .into_iter()
@@ -203,8 +244,11 @@ fn receive_msgs(streams: Vec<TcpStream>) -> Vec<TcpStream> {
         .fold(retained, |acc, (msg, origin)| propagate(acc, msg, origin))
 }
 
-fn process_msg(mut stream: TcpStream) -> Option<(TcpStream, Option<(Msg, SocketAddr)>)> {
-    let mut msg = [0; 128];
+fn process_msg(
+    mut stream: TcpStream,
+    seen: &mut Queue<Msg>,
+) -> Option<(TcpStream, Option<(Msg, SocketAddr)>)> {
+    let mut msg = [0; CAPACITY];
     let addr = stream.peer_addr().expect("connection didn't have a peer");
 
     match stream.read(&mut msg) {
@@ -216,6 +260,13 @@ fn process_msg(mut stream: TcpStream) -> Option<(TcpStream, Option<(Msg, SocketA
         Err(err) => panic!("IO error: {err}"),
         Ok(_) => {
             let m: Msg = msg.try_into().unwrap();
+
+            if seen.contains(&m) {
+                return Some((stream, None));
+            }
+
+            seen.push(m.clone());
+
             println!("{addr}: {}", m.text);
 
             Some((stream, Some((m, addr))))
