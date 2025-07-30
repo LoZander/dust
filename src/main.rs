@@ -1,7 +1,7 @@
 use std::{
     env,
     io::{self, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{self, Shutdown, SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::mpsc::{self, TryRecvError},
     thread::spawn,
@@ -34,28 +34,39 @@ fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
 #[derive(Debug, Clone)]
 enum Command {
     Connect(SocketAddr),
-    Broadcast(String),
+    Broadcast(Msg),
     Disconnect,
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("parse error")]
-struct ParseCommandError;
+enum ParseCommandError {
+    #[error("invalid command `{0}`")]
+    InvalidCommand(String),
+    #[error("missing seperator")]
+    MissingSep,
+    #[error(transparent)]
+    TryFromStringToMsgError(#[from] msg::TryFromStringToMsgError),
+    #[error(transparent)]
+    AddrParseError(#[from] net::AddrParseError),
+}
 
 impl FromStr for Command {
     type Err = ParseCommandError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (cmd, args) = s.trim().split_once(" ").ok_or(ParseCommandError)?;
+        let (cmd, args) = s
+            .trim()
+            .split_once(" ")
+            .ok_or(ParseCommandError::MissingSep)?;
 
         match cmd {
-            "broadcast" => Ok(Command::Broadcast(args.to_string())),
+            "broadcast" => Ok(Command::Broadcast(args.to_string().try_into()?)),
             "connect" => {
-                let addr: SocketAddr = args.parse().map_err(|_| ParseCommandError)?;
+                let addr: SocketAddr = args.parse()?;
                 Ok(Command::Connect(addr))
             }
             "disconnect" => Ok(Command::Disconnect),
-            _ => Err(ParseCommandError),
+            c => Err(ParseCommandError::InvalidCommand(c.to_string())),
         }
     }
 }
@@ -102,11 +113,8 @@ fn run(ip: SocketAddr) -> io::Result<()> {
                     connect(&mut streams, addr)?;
                     streams
                 }
-                Command::Broadcast(s) => {
-                    let msg: Msg = s.try_into().unwrap();
-
+                Command::Broadcast(msg) => {
                     seen.push(msg.clone());
-
                     broadcast(streams, msg)
                 }
                 Command::Disconnect => {
