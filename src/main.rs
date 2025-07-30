@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env,
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
@@ -7,18 +6,6 @@ use std::{
     sync::mpsc::{self, TryRecvError},
     thread::spawn,
 };
-
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Request {
-    Connect,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum Response {
-    Connect(HashSet<SocketAddr>),
-}
 
 fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
     let listener = TcpListener::bind(ip.into())?;
