@@ -7,6 +7,8 @@ use std::{
     thread::spawn,
 };
 
+use uuid::Uuid;
+
 fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
     let listener = TcpListener::bind(ip.into())?;
     let (tx, rx) = mpsc::channel();
@@ -25,6 +27,7 @@ fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
     Ok(rx)
 }
 
+#[derive(Debug, Clone)]
 enum Command {
     Connect(SocketAddr),
     Broadcast(String),
@@ -50,6 +53,87 @@ impl FromStr for Command {
             "disconnect" => Ok(Command::Disconnect),
             _ => Err(ParseCommandError),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Msg {
+    text: String,
+    uuid: Uuid,
+}
+
+const UUID_SIZE: usize = 16;
+const SEP_SIZE: usize = 1;
+const CAPACITY: usize = 128;
+
+#[derive(Debug, thiserror::Error)]
+#[error("failed to convert `String` to `Msg`")]
+struct TryFromStringToMsgError;
+
+impl TryFrom<String> for Msg {
+    type Error = TryFromStringToMsgError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let within_capacity = value.len() + SEP_SIZE + UUID_SIZE <= CAPACITY;
+
+        let uuid = Uuid::new_v4();
+
+        assert!(!uuid.as_bytes()[0] != 0, "Uuid started with 0!");
+
+        if within_capacity {
+            Ok(Self {
+                text: value,
+                uuid: Uuid::new_v4(),
+            })
+        } else {
+            Err(TryFromStringToMsgError)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum TryFromArrayToMsgError {
+    #[error("missing seperator")]
+    MissingSep,
+    #[error("uuid error: `{0}`")]
+    CorruptUuid(#[from] uuid::Error),
+}
+
+impl TryFrom<[u8; 128]> for Msg {
+    type Error = TryFromArrayToMsgError;
+
+    fn try_from(value: [u8; 128]) -> Result<Self, Self::Error> {
+        let sep = value
+            .iter()
+            .position(|c| c == &0)
+            .ok_or(TryFromArrayToMsgError::MissingSep)?;
+
+        let text_bytes = &value[..sep];
+        let uuid_bytes = &value[(sep + SEP_SIZE)..(sep + SEP_SIZE + UUID_SIZE)];
+
+        let text = String::from_utf8_lossy(text_bytes).to_string();
+        let uuid = Uuid::from_slice(uuid_bytes).unwrap();
+
+        Ok(Self { text, uuid })
+    }
+}
+
+impl Msg {
+    fn into_bytes(self) -> [u8; 128] {
+        let mut bytes = [0; 128];
+        let length = self.text.len();
+        self.text
+            .into_bytes()
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, b)| bytes[i] = b);
+        self.uuid
+            .into_bytes()
+            .into_iter()
+            .enumerate()
+            .for_each(|(i, b)| bytes[i + length + 1] = b);
+
+        bytes
     }
 }
 
@@ -94,7 +178,7 @@ fn run(ip: SocketAddr) -> io::Result<()> {
                     connect(&mut streams, addr)?;
                     streams
                 }
-                Command::Broadcast(msg) => broadcast(streams, msg),
+                Command::Broadcast(msg) => broadcast(streams, msg.try_into().unwrap()),
                 Command::Disconnect => {
                     streams
                         .iter_mut()
@@ -110,33 +194,8 @@ fn run(ip: SocketAddr) -> io::Result<()> {
 }
 
 fn receive_msgs(streams: Vec<TcpStream>) -> Vec<TcpStream> {
-    let (retained, propagees): (Vec<_>, Vec<_>) = streams
-        .into_iter()
-        .filter_map(|mut stream| {
-            let mut msg = [0; 128];
-            let addr = stream.peer_addr().expect("connection didn't have a peer");
-
-            match stream.read(&mut msg) {
-                Ok(0) => {
-                    println!("peer {addr} disconnected");
-                    None
-                }
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Some((stream, None)),
-                Err(err) => panic!("IO error: {err}"),
-                Ok(_) => {
-                    let s: &[u8] = msg
-                        .iter()
-                        .position(|c| c == &0)
-                        .map(|i| &msg[..i])
-                        .unwrap_or(&msg);
-                    let string_msg: String = String::from_utf8_lossy(s).into();
-                    println!("{addr}: {string_msg}");
-
-                    Some((stream, Some((string_msg, addr))))
-                }
-            }
-        })
-        .unzip();
+    let (retained, propagees): (Vec<_>, Vec<_>) =
+        streams.into_iter().filter_map(process_msg).unzip();
 
     propagees
         .into_iter()
@@ -144,7 +203,27 @@ fn receive_msgs(streams: Vec<TcpStream>) -> Vec<TcpStream> {
         .fold(retained, |acc, (msg, origin)| propagate(acc, msg, origin))
 }
 
-fn propagate(streams: Vec<TcpStream>, msg: String, origin: SocketAddr) -> Vec<TcpStream> {
+fn process_msg(mut stream: TcpStream) -> Option<(TcpStream, Option<(Msg, SocketAddr)>)> {
+    let mut msg = [0; 128];
+    let addr = stream.peer_addr().expect("connection didn't have a peer");
+
+    match stream.read(&mut msg) {
+        Ok(0) => {
+            println!("peer {addr} disconnected");
+            None
+        }
+        Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Some((stream, None)),
+        Err(err) => panic!("IO error: {err}"),
+        Ok(_) => {
+            let m: Msg = msg.try_into().unwrap();
+            println!("{addr}: {}", m.text);
+
+            Some((stream, Some((m, addr))))
+        }
+    }
+}
+
+fn propagate(streams: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpStream> {
     let (mut origins, rest): (Vec<_>, Vec<_>) = streams
         .into_iter()
         .partition(|stream| stream.peer_addr().unwrap() == origin);
@@ -169,11 +248,13 @@ fn connect(streams: &mut Vec<TcpStream>, addr: SocketAddr) -> io::Result<()> {
     Ok(())
 }
 
-fn broadcast(mut streams: Vec<TcpStream>, msg: String) -> Vec<TcpStream> {
-    println!("broadcasting {msg}");
+fn broadcast(mut streams: Vec<TcpStream>, msg: Msg) -> Vec<TcpStream> {
+    println!("broadcasting {msg:?}");
     streams.iter_mut().for_each(|stream| {
-        println!("broadcasting {msg} to {stream:?}");
-        let written = stream.write(msg.as_bytes()).expect("writing failed");
+        println!("broadcasting {msg:?} to {stream:?}");
+        let written = stream
+            .write(&msg.clone().into_bytes())
+            .expect("writing message failed");
         println!("written {written} bytes");
     });
 
