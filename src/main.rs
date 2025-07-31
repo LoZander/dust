@@ -13,6 +13,7 @@ use queue::Queue;
 mod msg;
 mod queue;
 
+/// Listens for incoming connections and returns a channel over which these are sent.
 fn listen(ip: impl Into<SocketAddr>) -> io::Result<mpsc::Receiver<TcpStream>> {
     let listener = TcpListener::bind(ip.into())?;
     let (tx, rx) = mpsc::channel();
@@ -71,6 +72,7 @@ impl FromStr for Command {
     }
 }
 
+/// Reads terminal input and returns a channel over which these inputs are sent.
 fn read_input() -> io::Result<mpsc::Receiver<Command>> {
     let (tx, rx) = mpsc::channel();
     spawn(move || -> io::Result<()> {
@@ -87,9 +89,10 @@ fn read_input() -> io::Result<mpsc::Receiver<Command>> {
     Ok(rx)
 }
 
+/// Runs the p2p peer on the given socket.
 fn run(ip: SocketAddr) -> io::Result<()> {
     println!("starting on {ip}");
-    let mut streams = Vec::new();
+    let mut peers = Vec::new();
     let mut seen: Queue<Msg> = Queue::new(16);
 
     let in_comms = listen(ip)?;
@@ -101,38 +104,38 @@ fn run(ip: SocketAddr) -> io::Result<()> {
             Err(TryRecvError::Disconnected) => todo!(),
             Ok(comm) => {
                 println!("new peer {}", comm.peer_addr().unwrap());
-                streams.push(comm);
+                peers.push(comm);
             }
         };
 
-        streams = match cmds.try_recv() {
-            Err(TryRecvError::Empty) => streams,
+        peers = match cmds.try_recv() {
+            Err(TryRecvError::Empty) => peers,
             Err(TryRecvError::Disconnected) => todo!(),
             Ok(cmd) => match cmd {
                 Command::Connect(addr) => {
-                    connect(&mut streams, addr)?;
-                    streams
+                    connect(&mut peers, addr)?;
+                    peers
                 }
                 Command::Broadcast(msg) => {
                     seen.push(msg.clone());
-                    broadcast(streams, msg)
+                    broadcast(peers, msg)
                 }
                 Command::Disconnect => {
-                    streams
+                    peers
                         .iter_mut()
                         .map(|stream| stream.shutdown(Shutdown::Both))
                         .collect::<io::Result<()>>()?;
-                    streams
+                    peers
                 }
             },
         };
 
-        streams = receive_msgs(streams, &mut seen);
+        peers = receive_msgs(peers, &mut seen);
     }
 }
 
-fn receive_msgs(streams: Vec<TcpStream>, seen: &mut Queue<Msg>) -> Vec<TcpStream> {
-    let (retained, propagees): (Vec<_>, Vec<_>) = streams
+fn receive_msgs(peers: Vec<TcpStream>, seen: &mut Queue<Msg>) -> Vec<TcpStream> {
+    let (retained, propagees): (Vec<_>, Vec<_>) = peers
         .into_iter()
         .filter_map(|stream| process_msg(stream, seen))
         .unzip();
@@ -174,8 +177,8 @@ fn process_msg(
 }
 
 /// Propagates a message `msg` received from a peer `origin` to the other peers.
-fn propagate(streams: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpStream> {
-    let (mut origins, rest): (Vec<_>, Vec<_>) = streams
+fn propagate(peers: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpStream> {
+    let (mut origins, rest): (Vec<_>, Vec<_>) = peers
         .into_iter()
         .partition(|stream| stream.peer_addr().unwrap() == origin);
     let mut rest = broadcast(
@@ -191,19 +194,19 @@ fn propagate(streams: Vec<TcpStream>, msg: Msg, origin: SocketAddr) -> Vec<TcpSt
 }
 
 /// Connects to a given peer.
-fn connect(streams: &mut Vec<TcpStream>, addr: SocketAddr) -> io::Result<()> {
+fn connect(peers: &mut Vec<TcpStream>, addr: SocketAddr) -> io::Result<()> {
     let conn = TcpStream::connect(addr)?;
     conn.set_nonblocking(true)
         .expect("setting nonblocking failed");
     println!("connecting {conn:?}");
-    streams.push(conn);
+    peers.push(conn);
     Ok(())
 }
 
 /// Broadcasts a message to peers.
-fn broadcast(mut streams: Vec<TcpStream>, msg: Msg) -> Vec<TcpStream> {
+fn broadcast(mut peers: Vec<TcpStream>, msg: Msg) -> Vec<TcpStream> {
     println!("broadcasting {msg:?}");
-    streams.iter_mut().for_each(|stream| {
+    peers.iter_mut().for_each(|stream| {
         println!("broadcasting {msg:?} to {stream:?}");
         let written = stream
             .write(&msg.clone().into_bytes())
@@ -211,7 +214,7 @@ fn broadcast(mut streams: Vec<TcpStream>, msg: Msg) -> Vec<TcpStream> {
         println!("written {written} bytes");
     });
 
-    streams
+    peers
 }
 
 fn main() {
