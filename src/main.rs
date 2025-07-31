@@ -4,7 +4,7 @@ use std::{
     net::{self, Shutdown, SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::mpsc::{self, TryRecvError},
-    thread::spawn,
+    thread::{self, spawn},
 };
 
 use msg::Msg;
@@ -72,21 +72,33 @@ impl FromStr for Command {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum InputError<T> {
+    #[error(transparent)]
+    ParseCommandError(#[from] ParseCommandError),
+    #[error(transparent)]
+    ReadError(#[from] mpsc::SendError<T>),
+    #[error(transparent)]
+    IoError(#[from] io::Error),
+}
+
 /// Reads terminal input and returns a channel over which these inputs are sent.
-fn read_input() -> io::Result<mpsc::Receiver<Command>> {
+fn read_input() -> mpsc::Receiver<Result<Command, InputError<Command>>> {
     let (tx, rx) = mpsc::channel();
-    spawn(move || -> io::Result<()> {
+
+    spawn(move || -> Result<(), InputError<Command>> {
         loop {
             let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
+            let command: Result<Command, _> = io::stdin()
+                .read_line(&mut input)
+                .map_err(InputError::from)
+                .and_then(|_| input.parse::<Command>().map_err(InputError::from));
 
-            let command = input.parse().unwrap();
-
-            tx.send(command).unwrap();
+            tx.send(command).expect("sending over input-thread failed");
         }
     });
 
-    Ok(rx)
+    rx
 }
 
 /// Runs the p2p peer on the given socket.
@@ -96,7 +108,7 @@ fn run(ip: SocketAddr) -> io::Result<()> {
     let mut seen: Queue<Msg> = Queue::new(16);
 
     let in_comms = listen(ip)?;
-    let cmds = read_input()?;
+    let cmds = read_input();
 
     loop {
         match in_comms.try_recv() {
@@ -112,19 +124,24 @@ fn run(ip: SocketAddr) -> io::Result<()> {
             Err(TryRecvError::Empty) => peers,
             Err(TryRecvError::Disconnected) => todo!(),
             Ok(cmd) => match cmd {
-                Command::Connect(addr) => {
+                Ok(Command::Connect(addr)) => {
                     connect(&mut peers, addr)?;
                     peers
                 }
-                Command::Broadcast(msg) => {
+                Ok(Command::Broadcast(msg)) => {
                     seen.push(msg.clone());
                     broadcast(peers, msg)
                 }
-                Command::Disconnect => {
+                Ok(Command::Disconnect) => {
                     peers
                         .iter_mut()
                         .map(|stream| stream.shutdown(Shutdown::Both))
                         .collect::<io::Result<()>>()?;
+                    peers
+                }
+                Err(err) => {
+                    println!("input error: {err}");
+                    println!("skipping command due to error");
                     peers
                 }
             },
@@ -160,19 +177,24 @@ fn process_msg(
         }
         Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Some((stream, None)),
         Err(err) => panic!("IO error: {err}"),
-        Ok(_) => {
-            let m: Msg = msg.try_into().unwrap();
+        Ok(_) => match Msg::try_from(msg) {
+            Ok(m) => {
+                if seen.contains(&m) {
+                    return Some((stream, None));
+                }
 
-            if seen.contains(&m) {
-                return Some((stream, None));
+                seen.push(m.clone());
+
+                println!("{addr}: {}", m.text);
+
+                Some((stream, Some((m, addr))))
             }
-
-            seen.push(m.clone());
-
-            println!("{addr}: {}", m.text);
-
-            Some((stream, Some((m, addr))))
-        }
+            Err(err) => {
+                println!("{err}");
+                println!("skipping message due to error");
+                Some((stream, None))
+            }
+        },
     }
 }
 
