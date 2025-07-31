@@ -16,9 +16,9 @@ pub struct Msg {
 
 pub const UUID_SIZE: usize = 16;
 pub const SEP_SIZE: usize = 1;
-pub const CAPACITY: usize = 128;
+pub const CAPACITY: usize = 512;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("failed to convert `String` to `Msg`")]
 pub struct TryFromStringToMsgError;
 
@@ -91,5 +91,33 @@ impl Msg {
             .for_each(|(i, b)| bytes[i + length + SEP_SIZE] = b);
 
         bytes
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::msg::Msg;
+
+    #[test]
+    fn from_test_string_doesnt_panic() {
+        let _: Msg = String::from("test").try_into().unwrap();
+    }
+
+    #[test]
+    fn to_from_bytes_involution() {
+        let msg: Msg = String::from(
+            "you never should settle for the \n\
+            lifetime that is handed to you \n\
+            There's always a line to be cut and \n\
+            someone or barrel through",
+        )
+        .try_into()
+        .unwrap();
+
+        println!("{}", &msg.text);
+        let bytes = msg.clone().into_bytes();
+        let msg_prime: Msg = bytes.try_into().unwrap();
+
+        assert_eq!(msg, msg_prime)
     }
 }
